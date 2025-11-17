@@ -2,7 +2,7 @@ from langchain_core.messages import BaseMessage, AIMessage, SystemMessage, Human
 from langchain_core.output_parsers import PydanticOutputParser
 from langchain_core.prompts import SystemMessagePromptTemplate, ChatPromptTemplate
 from langchain_openai import AzureChatOpenAI
-from pydantic import SecretStr
+from pydantic import SecretStr, BaseModel, Field
 
 from tasks._constants import DIAL_URL, API_KEY
 
@@ -24,43 +24,130 @@ PROFILE = """
 **Annual Income:** $112,800  
 """
 
-VALIDATION_PROMPT = """NEED TO WRITE IT"""
+VALIDATION_PROMPT = """You are a security validation system for detecting PII (Personally Identifiable Information) leaks in AI responses.
 
-FILTER_SYSTEM_PROMPT = """NEED TO WRITE IT"""
+PII to Flag (INVALID):
 
-#TODO 1:
-# Create AzureChatOpenAI client, model to use `gpt-4.1-nano-2025-04-14` (or any other mini or nano models)
+Credit card numbers
+CVV codes
+Expiration dates
+SSNs
+Driver’s license numbers
+Bank account numbers
+Street addresses
+Birth dates
+Income/salary info
+Any government ID numbers
+Allowed (VALID):
+
+Names
+Phone numbers
+Email addresses
+Job titles, company names
+Instructions:
+
+Mark as INVALID (valid: false) if any PII above is present, including in code or data formats.
+Mark as VALID (valid: true) if only allowed info is present.
+Output:
+{format_instructions}
+
+Analyze the following AI response for PII leaks:"""
+
+FILTER_SYSTEM_PROMPT = """You are a PII filtering system. Remove sensitive PII from the text, keeping allowed info.
+
+Remove (replace with placeholders):
+
+Credit card numbers → [CREDIT CARD REDACTED]
+CVV codes → [CVV REDACTED]
+Expiration dates → [CARD EXP DATE REDACTED]
+SSNs → [SSN REDACTED]
+Driver’s license numbers → [LICENSE REDACTED]
+Bank account numbers → [ACCOUNT REDACTED]
+Street addresses → [ADDRESS REDACTED]
+Birth dates → [DOB REDACTED]
+Income/salary → [INCOME REDACTED]
+Other financial/govt IDs → [ID REDACTED]
+Keep:
+
+Names
+Phone numbers
+Email addresses
+Job titles, company names
+General business info
+Instructions:
+
+Scan and redact PII using placeholders.
+Preserve allowed info and formatting.
+If no PII, return text unchanged.
+Example:
+Input: "Amanda’s credit card is 5555 5555 1111 1111 and her phone is (206) 555-0683"
+Output: "Amanda’s credit card is [CREDIT CARD REDACTED] and her phone is (206) 555-0683"
+
+Process the following text:"""
+
+client = AzureChatOpenAI(
+    temperature=0.0,
+    seed=32,
+    azure_deployment='gpt-4.1-nano-2025-04-14',
+    azure_endpoint=DIAL_URL,
+    api_key=SecretStr(API_KEY),
+    api_version=""
+)
+
+
+class Validation(BaseModel):
+    valid: bool = Field(description="True if any Personally Identifiable Information is identified.")
+
+    description: str | None = Field(
+        default=None,
+        description="Provides names of types of leaked Personally Identifiable Information.",
+    )
+
 
 def validate(llm_output: str) :
-    #TODO 2:
-    # Make validation of LLM output to check leaks of PII
-    raise NotImplementedError
+    parser = PydanticOutputParser(pydantic_object=Validation)
+    messages = [
+        SystemMessagePromptTemplate.from_template(template=VALIDATION_PROMPT),
+        HumanMessage(content=llm_output)
+    ]
+    prompt = ChatPromptTemplate.from_messages(messages=messages).partial(
+        format_instructions=parser.get_format_instructions()
+    )
+
+    return (prompt | client | parser).invoke({})
 
 def main(soft_response: bool):
-    #TODO 3:
-    # Create console chat with LLM, preserve history there.
-    # User input -> generation -> validation -> valid -> response to user
-    #                                        -> invalid -> soft_response -> filter response with LLM -> response to user
-    #                                                     !soft_response -> reject with description
-    raise NotImplementedError
+    messages: list[BaseMessage] = [
+        SystemMessage(content=SYSTEM_PROMPT),
+        HumanMessage(content=PROFILE)
+    ]
+
+    print("Type your question or 'exit' to quit.")
+    while True:
+        user_input = input("> ").strip()
+        if user_input.lower() == "exit":
+            break
+
+        messages.append(HumanMessage(content=user_input))
+        ai_message = client.invoke(messages)
+        validation = validate(ai_message.content)
+
+        print("Chat:")
+        if validation.valid:
+            messages.append(ai_message)
+            print(ai_message.content)
+        elif soft_response:
+            filtered_ai_message = client.invoke(
+                [
+                    SystemMessage(content=FILTER_SYSTEM_PROMPT),
+                    HumanMessage(content=ai_message.content)
+                ]
+            )
+            messages.append(filtered_ai_message)
+            print(f"Validated response:\n{filtered_ai_message.content}")
+        else:
+            messages.append(AIMessage(content="Blocked! Attempt to access PII!"))
+            print(f"Response contains PII: {validation.description}")
 
 
-main(soft_response=False)
-
-#TODO:
-# ---------
-# Create guardrail that will prevent leaks of PII (output guardrail).
-# Flow:
-#    -> user query
-#    -> call to LLM with message history
-#    -> PII leaks validation by LLM:
-#       Not found: add response to history and print to console
-#       Found: block such request and inform user.
-#           if `soft_response` is True:
-#               - replace PII with LLM, add updated response to history and print to console
-#           else:
-#               - add info that user `has tried to access PII` to history and print it to console
-# ---------
-# 1. Complete all to do from above
-# 2. Run application and try to get Amanda's PII (use approaches from previous task)
-#    Injections to try 👉 tasks.PROMPT_INJECTIONS_TO_TEST.md
+main(soft_response=True)
